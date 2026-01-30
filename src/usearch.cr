@@ -183,6 +183,56 @@ module USearch
       end
     end
 
+    # Searches for the k nearest neighbors with a filter predicate.
+    #
+    # - `query`: The query vector (must match index dimensions)
+    # - `k`: Maximum number of neighbors to return
+    # - `&filter`: Block that receives a key and returns true to include it
+    #
+    # Example:
+    # ```
+    # # Only return vectors with even keys
+    # results = index.filtered_search(query, k: 10) { |key| key.even? }
+    #
+    # # Only return vectors in a specific set
+    # valid_ids = Set{1_u64, 5_u64, 10_u64}
+    # results = index.filtered_search(query, k: 10) { |key| valid_ids.includes?(key) }
+    # ```
+    def filtered_search(query : Array(Float32) | Slice(Float32), k : Int = 10, &filter : UInt64 -> Bool) : Array(SearchResult)
+      check_open
+      raise Error.new("Query dimension mismatch: expected #{@dimensions}, got #{query.size}") if query.size != @dimensions
+
+      keys = Slice(UInt64).new(k, 0_u64)
+      distances = Slice(Float32).new(k, 0_f32)
+      error = Pointer(LibC::Char).null
+
+      # Box the proc so we can pass it through void*
+      boxed_filter = Box.box(filter)
+
+      # C callback that unboxes and calls the Crystal proc
+      callback = LibUSearch::FilterCallback.new do |key, state|
+        proc = Box(typeof(filter)).unbox(state)
+        proc.call(key) ? 1 : 0
+      end
+
+      found = LibUSearch.filtered_search(
+        @handle,
+        query.to_unsafe.as(Void*),
+        LibUSearch::ScalarKind::F32,
+        k.to_u64,
+        callback,
+        boxed_filter,
+        keys.to_unsafe,
+        distances.to_unsafe,
+        pointerof(error)
+      )
+      check_error(error)
+
+      Array(SearchResult).new(found.to_i) do |i|
+        SearchResult.new(keys[i], distances[i])
+      end
+    end
+
     # Removes a vector by key.
     def remove(key : UInt64)
       check_open

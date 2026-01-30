@@ -117,6 +117,23 @@ lib LibUSearch
     error : Error*
   ) : LibC::SizeT
 
+  # Filtered search callback type.
+  # Returns non-zero to include the key, zero to exclude.
+  alias FilterCallback = (Key, Void*) -> LibC::Int
+
+  # Filtered search
+  fun filtered_search = usearch_filtered_search(
+    index : Index,
+    query : Void*,
+    query_kind : ScalarKind,
+    count : LibC::SizeT,
+    filter : FilterCallback,
+    filter_state : Void*,
+    keys : Key*,
+    distances : Distance*,
+    error : Error*
+  ) : LibC::SizeT
+
   # Distance computation (standalone)
   fun distance = usearch_distance(
     vector_a : Void*,

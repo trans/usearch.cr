@@ -76,6 +76,49 @@ describe USearch do
       end
     end
 
+    describe "#filtered_search" do
+      it "filters results with a predicate" do
+        index = USearch::Index.new(dimensions: test_dims, metric: :cos)
+
+        # Add vectors with keys 0-9
+        10.times do |i|
+          vec = [i.to_f32, 0.0_f32, 0.0_f32, 0.0_f32]
+          index.add(i.to_u64, vec)
+        end
+
+        # Search with filter: only even keys
+        query = [5.0_f32, 0.0_f32, 0.0_f32, 0.0_f32]
+        results = index.filtered_search(query, k: 5) { |key| key.even? }
+
+        # All results should have even keys
+        results.each do |r|
+          r.key.even?.should be_true
+        end
+
+        index.close
+      end
+
+      it "filters with a set of valid keys" do
+        index = USearch::Index.new(dimensions: test_dims, metric: :cos)
+
+        5.times do |i|
+          vec = [i.to_f32, 0.0_f32, 0.0_f32, 0.0_f32]
+          index.add(i.to_u64, vec)
+        end
+
+        valid_keys = Set{1_u64, 3_u64}
+        query = [2.0_f32, 0.0_f32, 0.0_f32, 0.0_f32]
+        results = index.filtered_search(query, k: 5) { |key| valid_keys.includes?(key) }
+
+        results.size.should be <= 2
+        results.each do |r|
+          valid_keys.includes?(r.key).should be_true
+        end
+
+        index.close
+      end
+    end
+
     describe "#remove" do
       it "removes a vector by key" do
         index = USearch::Index.new(dimensions: test_dims)
