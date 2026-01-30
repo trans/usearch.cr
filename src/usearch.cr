@@ -417,6 +417,39 @@ module USearch
       result
     end
 
+    # Returns the number of vectors for a key (useful in multi-mode).
+    #
+    # In single-mode, returns 1 if key exists, 0 otherwise.
+    def count(key : UInt64) : UInt64
+      check_open
+      error = Pointer(LibC::Char).null
+      result = LibUSearch.count(@handle, key, pointerof(error))
+      check_error(error)
+      result.to_u64
+    end
+
+    # Retrieves the vector data for a key.
+    #
+    # Returns nil if the key doesn't exist.
+    def get(key : UInt64) : Array(Float32)?
+      check_open
+      return nil unless contains?(key)
+
+      vector = Array(Float32).new(@dimensions.to_i, 0_f32)
+      error = Pointer(LibC::Char).null
+
+      LibUSearch.get(
+        @handle,
+        key,
+        1_u64,  # count (number of vectors to retrieve)
+        vector.to_unsafe.as(Void*),
+        LibUSearch::ScalarKind::F32,
+        pointerof(error)
+      )
+      check_error(error)
+      vector
+    end
+
     # Renames a key (changes the ID associated with a vector).
     def rename(from : UInt64, to : UInt64)
       check_open
@@ -491,6 +524,15 @@ module USearch
       check_open
       error = Pointer(LibC::Char).null
       result = LibUSearch.memory_usage(@handle, pointerof(error))
+      check_error(error)
+      result.to_u64
+    end
+
+    # Returns the HNSW connectivity parameter (M).
+    def connectivity : UInt64
+      check_open
+      error = Pointer(LibC::Char).null
+      result = LibUSearch.connectivity(@handle, pointerof(error))
       check_error(error)
       result.to_u64
     end

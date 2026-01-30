@@ -158,6 +158,50 @@ describe USearch do
       end
     end
 
+    describe "#count" do
+      it "returns count for a key" do
+        index = USearch::Index.new(dimensions: test_dims)
+
+        index.count(1_u64).should eq 0
+
+        index.add(1_u64, [1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32])
+
+        index.count(1_u64).should eq 1
+        index.count(2_u64).should eq 0
+
+        index.close
+      end
+    end
+
+    describe "#get" do
+      it "retrieves vector data by key" do
+        index = USearch::Index.new(dimensions: test_dims, quantization: :f32)
+        vec = [1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32]
+
+        index.add(1_u64, vec)
+
+        retrieved = index.get(1_u64)
+        retrieved.should_not be_nil
+        retrieved = retrieved.not_nil!
+
+        # Check values are close (may have minor floating point differences)
+        retrieved.size.should eq test_dims
+        retrieved.each_with_index do |val, i|
+          val.should be_close(vec[i], 0.01)
+        end
+
+        index.close
+      end
+
+      it "returns nil for non-existent key" do
+        index = USearch::Index.new(dimensions: test_dims)
+
+        index.get(999_u64).should be_nil
+
+        index.close
+      end
+    end
+
     describe "#filtered_search" do
       it "filters results with a predicate" do
         index = USearch::Index.new(dimensions: test_dims, metric: :cos)
@@ -253,6 +297,34 @@ describe USearch do
           results[0].key.should eq 1_u64
 
           loaded.close
+        ensure
+          File.delete(path) if File.exists?(path)
+        end
+      end
+    end
+
+    describe ".view" do
+      it "memory-maps an index from a file" do
+        path = File.tempname("usearch_view", ".usearch")
+
+        begin
+          # Create and save
+          index = USearch::Index.new(dimensions: test_dims, metric: :cos)
+          index.add(1_u64, [1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32])
+          index.add(2_u64, [0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32])
+          index.save(path)
+          index.close
+
+          # View (memory-mapped)
+          viewed = USearch::Index.view(path, dimensions: test_dims, metric: :cos)
+          viewed.size.should eq 2
+          viewed.contains?(1_u64).should be_true
+
+          # Search should work
+          results = viewed.search([0.9_f32, 0.1_f32, 0.0_f32, 0.0_f32], k: 1)
+          results[0].key.should eq 1_u64
+
+          viewed.close
         ensure
           File.delete(path) if File.exists?(path)
         end
@@ -461,6 +533,79 @@ describe USearch do
         results = index.search([1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32], k: 1)
         results[0].key.should eq 1_u64
 
+        index.close
+      end
+    end
+
+    describe "#set_custom_metric" do
+      it "accepts a custom metric callback" do
+        index = USearch::Index.new(dimensions: 2, metric: :cos)
+
+        # Define a simple L2 distance callback
+        callback = LibUSearch::MetricCallback.new do |a, b|
+          # Simple L2 for 2D vectors (hardcoded for test)
+          va = a.as(Pointer(Float32))
+          vb = b.as(Pointer(Float32))
+          dx = va[0] - vb[0]
+          dy = va[1] - vb[1]
+          Math.sqrt(dx * dx + dy * dy).to_f32
+        end
+
+        index.set_custom_metric(callback, :l2sq)
+
+        # Add and search with custom metric
+        index.add(1_u64, [0.0_f32, 0.0_f32])
+        index.add(2_u64, [1.0_f32, 1.0_f32])
+
+        results = index.search([0.1_f32, 0.1_f32], k: 2)
+        results[0].key.should eq 1_u64  # Closer to origin
+
+        index.close
+      end
+    end
+
+    describe "#threads_add=" do
+      it "sets the number of threads for add operations" do
+        index = USearch::Index.new(dimensions: test_dims)
+        index.threads_add = 2
+        # Just verify it doesn't raise
+        index.close
+      end
+    end
+
+    describe "#threads_search=" do
+      it "sets the number of threads for search operations" do
+        index = USearch::Index.new(dimensions: test_dims)
+        index.threads_search = 2
+        # Just verify it doesn't raise
+        index.close
+      end
+    end
+
+    describe "#memory_usage" do
+      it "returns memory usage in bytes" do
+        index = USearch::Index.new(dimensions: test_dims)
+        index.add(1_u64, [1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32])
+
+        usage = index.memory_usage
+        usage.should be > 0
+
+        index.close
+      end
+    end
+
+    describe "#connectivity" do
+      it "returns the HNSW connectivity parameter" do
+        index = USearch::Index.new(dimensions: test_dims, connectivity: 32)
+        index.connectivity.should eq 32
+        index.close
+      end
+    end
+
+    describe "#dimensions" do
+      it "returns the vector dimensionality" do
+        index = USearch::Index.new(dimensions: 128)
+        index.dimensions.should eq 128
         index.close
       end
     end
