@@ -3,7 +3,11 @@
 # This module provides direct bindings to the USearch C API.
 # For most use cases, prefer the high-level `USearch::Index` class.
 
-@[Link("usearch_c")]
+{% if flag?(:usearch_dynamic) %}
+  @[Link("usearch_c")]
+{% else %}
+  @[Link(ldflags: "#{__DIR__}/../../vendor/usearch/build/libusearch_static_c.a -lstdc++ -lm")]
+{% end %}
 lib LibUSearch
   # Opaque handle to a USearch index.
   type Index = Void*
@@ -57,15 +61,25 @@ lib LibUSearch
 
   # Version info
   fun version = usearch_version : LibC::Char*
+  fun hardware_acceleration = usearch_hardware_acceleration : LibC::Char*
 
   # Lifecycle
   fun init = usearch_init(options : InitOptions*, error : Error*) : Index
   fun free = usearch_free(index : Index, error : Error*) : Void
 
-  # Persistence
+  # Persistence (file)
   fun save = usearch_save(index : Index, path : LibC::Char*, error : Error*) : Void
   fun load = usearch_load(index : Index, path : LibC::Char*, error : Error*) : Void
   fun view = usearch_view(index : Index, path : LibC::Char*, error : Error*) : Void
+
+  # Persistence (buffer)
+  fun save_buffer = usearch_save_buffer(index : Index, buffer : Void*, length : LibC::SizeT, error : Error*) : Void
+  fun load_buffer = usearch_load_buffer(index : Index, buffer : Void*, length : LibC::SizeT, error : Error*) : Void
+  fun view_buffer = usearch_view_buffer(index : Index, buffer : Void*, length : LibC::SizeT, error : Error*) : Void
+
+  # Metadata (inspect without loading)
+  fun metadata = usearch_metadata(path : LibC::Char*, options : InitOptions*, error : Error*) : Void
+  fun metadata_buffer = usearch_metadata_buffer(buffer : Void*, length : LibC::SizeT, options : InitOptions*, error : Error*) : Void
 
   # Stats
   fun size = usearch_size(index : Index, error : Error*) : LibC::SizeT
@@ -77,10 +91,19 @@ lib LibUSearch
 
   # Configuration
   fun reserve = usearch_reserve(index : Index, capacity : LibC::SizeT, error : Error*) : Void
+  fun expansion_add = usearch_expansion_add(index : Index, error : Error*) : LibC::SizeT
+  fun expansion_search = usearch_expansion_search(index : Index, error : Error*) : LibC::SizeT
   fun change_expansion_add = usearch_change_expansion_add(index : Index, expansion : LibC::SizeT, error : Error*) : Void
   fun change_expansion_search = usearch_change_expansion_search(index : Index, expansion : LibC::SizeT, error : Error*) : Void
   fun change_threads_add = usearch_change_threads_add(index : Index, threads : LibC::SizeT, error : Error*) : Void
   fun change_threads_search = usearch_change_threads_search(index : Index, threads : LibC::SizeT, error : Error*) : Void
+  fun change_metric_kind = usearch_change_metric_kind(index : Index, metric : MetricKind, error : Error*) : Void
+
+  # Custom metric callback type.
+  # Takes two vectors and returns a distance value.
+  alias MetricCallback = (Void*, Void*) -> Distance
+
+  fun change_metric = usearch_change_metric(index : Index, metric : MetricCallback, state : Void*, metric_kind : MetricKind, error : Error*) : Void
 
   # Data operations
   fun add = usearch_add(
@@ -143,4 +166,25 @@ lib LibUSearch
     metric : MetricKind,
     error : Error*
   ) : Distance
+
+  # Exact (brute-force) search across a dataset.
+  # Useful for ground truth computation or small datasets.
+  fun exact_search = usearch_exact_search(
+    dataset : Void*,
+    dataset_size : LibC::SizeT,
+    dataset_stride : LibC::SizeT,
+    queries : Void*,
+    queries_size : LibC::SizeT,
+    queries_stride : LibC::SizeT,
+    kind : ScalarKind,
+    dimensions : LibC::SizeT,
+    metric : MetricKind,
+    count : LibC::SizeT,
+    threads : LibC::SizeT,
+    keys : Key*,
+    keys_stride : LibC::SizeT,
+    distances : Distance*,
+    distances_stride : LibC::SizeT,
+    error : Error*
+  ) : Void
 end

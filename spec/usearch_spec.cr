@@ -8,6 +8,88 @@ describe USearch do
     end
   end
 
+  describe ".hardware_acceleration" do
+    it "returns a string describing SIMD support" do
+      accel = USearch.hardware_acceleration
+      accel.should_not be_empty
+      # Common values: "serial", "neon", "sve", "avx2", "avx512"
+    end
+  end
+
+  describe ".exact_search" do
+    it "finds exact nearest neighbors" do
+      dataset = [
+        [1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32],
+        [0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32],
+        [0.0_f32, 0.0_f32, 1.0_f32, 0.0_f32],
+        [0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32],
+      ]
+
+      queries = [
+        [0.9_f32, 0.1_f32, 0.0_f32, 0.0_f32],  # Closest to dataset[0]
+        [0.0_f32, 0.9_f32, 0.1_f32, 0.0_f32],  # Closest to dataset[1]
+      ]
+
+      results = USearch.exact_search(dataset, queries, k: 2, metric: :cos)
+
+      results.size.should eq 2
+      results[0].size.should eq 2
+      results[0][0].key.should eq 0_u64  # First query closest to first dataset vector
+      results[1][0].key.should eq 1_u64  # Second query closest to second dataset vector
+    end
+
+    it "handles single query" do
+      dataset = [
+        [1.0_f32, 0.0_f32],
+        [0.0_f32, 1.0_f32],
+      ]
+
+      queries = [
+        [0.7_f32, 0.3_f32],
+      ]
+
+      results = USearch.exact_search(dataset, queries, k: 2, metric: :cos)
+
+      results.size.should eq 1
+      results[0].size.should eq 2
+      results[0][0].key.should eq 0_u64  # Closer to [1, 0]
+    end
+
+    it "raises on empty dataset" do
+      expect_raises(USearch::Error, /empty/) do
+        USearch.exact_search([] of Array(Float32), [[1.0_f32]], k: 1)
+      end
+    end
+
+    it "raises on empty queries" do
+      expect_raises(USearch::Error, /empty/) do
+        USearch.exact_search([[1.0_f32]], [] of Array(Float32), k: 1)
+      end
+    end
+
+    it "raises on dimension mismatch" do
+      expect_raises(USearch::Error, /dimension mismatch/) do
+        USearch.exact_search(
+          [[1.0_f32, 2.0_f32]],
+          [[1.0_f32, 2.0_f32, 3.0_f32]],  # Wrong dimension
+          k: 1
+        )
+      end
+    end
+
+    it "raises on invalid k" do
+      expect_raises(USearch::Error, /k must be positive/) do
+        USearch.exact_search([[1.0_f32]], [[1.0_f32]], k: 0)
+      end
+    end
+
+    it "raises on invalid threads" do
+      expect_raises(USearch::Error, /threads must be positive/) do
+        USearch.exact_search([[1.0_f32]], [[1.0_f32]], k: 1, threads: 0)
+      end
+    end
+  end
+
   describe USearch::Index do
     test_dims = 4
 
@@ -186,6 +268,72 @@ describe USearch do
       end
     end
 
+    describe "#to_bytes and .from_bytes" do
+      it "serializes and deserializes an index" do
+        # Create and populate
+        index = USearch::Index.new(dimensions: test_dims, metric: :cos)
+        index.add(1_u64, [1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32])
+        index.add(2_u64, [0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32])
+
+        # Serialize
+        bytes = index.to_bytes
+        bytes.size.should be > 0
+        index.close
+
+        # Deserialize
+        loaded = USearch::Index.from_bytes(bytes, dimensions: test_dims, metric: :cos)
+        loaded.size.should eq 2
+        loaded.contains?(1_u64).should be_true
+        loaded.contains?(2_u64).should be_true
+
+        # Search should work
+        results = loaded.search([0.9_f32, 0.1_f32, 0.0_f32, 0.0_f32], k: 1)
+        results[0].key.should eq 1_u64
+
+        loaded.close
+      end
+    end
+
+    describe ".view_bytes" do
+      it "views an index from a buffer without copying" do
+        # Create and populate
+        index = USearch::Index.new(dimensions: test_dims, metric: :cos)
+        index.add(1_u64, [1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32])
+        index.add(2_u64, [0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32])
+
+        # Serialize
+        bytes = index.to_bytes
+        index.close
+
+        # View (zero-copy)
+        viewed = USearch::Index.view_bytes(bytes, dimensions: test_dims, metric: :cos)
+        viewed.size.should eq 2
+        viewed.contains?(1_u64).should be_true
+
+        # Search should work
+        results = viewed.search([0.9_f32, 0.1_f32, 0.0_f32, 0.0_f32], k: 1)
+        results[0].key.should eq 1_u64
+
+        viewed.close
+      end
+    end
+
+    describe "#serialized_length" do
+      it "returns the buffer size needed" do
+        index = USearch::Index.new(dimensions: test_dims)
+        index.add(1_u64, [1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32])
+
+        length = index.serialized_length
+        length.should be > 0
+
+        # Should match actual serialized size
+        bytes = index.to_bytes
+        bytes.size.should eq length
+
+        index.close
+      end
+    end
+
     describe "#rename" do
       it "changes a vector's key" do
         index = USearch::Index.new(dimensions: test_dims)
@@ -241,6 +389,79 @@ describe USearch do
       it "returns a version string" do
         version = USearch::Index.version
         version.should_not be_empty
+      end
+    end
+
+    describe ".metadata" do
+      it "reads metadata from a saved index file" do
+        path = File.tempname("usearch_meta", ".usearch")
+
+        begin
+          index = USearch::Index.new(dimensions: 8, metric: :cos, quantization: :f16)
+          index.add(1_u64, Array(Float32).new(8) { |i| i.to_f32 })
+          index.save(path)
+          index.close
+
+          meta = USearch::Index.metadata(path)
+          meta.dimensions.should eq 8
+          # Note: metric/quantization may not be preserved exactly in all usearch versions
+        ensure
+          File.delete(path) if File.exists?(path)
+        end
+      end
+    end
+
+    describe ".metadata_buffer" do
+      it "reads metadata from a serialized buffer" do
+        index = USearch::Index.new(dimensions: 16, metric: :l2sq, quantization: :f32)
+        index.add(1_u64, Array(Float32).new(16) { 1.0_f32 })
+        bytes = index.to_bytes
+        index.close
+
+        meta = USearch::Index.metadata_buffer(bytes)
+        meta.dimensions.should eq 16
+      end
+    end
+
+    describe "#expansion_add" do
+      it "gets and sets expansion_add" do
+        index = USearch::Index.new(dimensions: 4, expansion_add: 64)
+        index.expansion_add.should eq 64
+
+        index.expansion_add = 256
+        index.expansion_add.should eq 256
+
+        index.close
+      end
+    end
+
+    describe "#expansion_search" do
+      it "gets and sets expansion_search" do
+        index = USearch::Index.new(dimensions: 4, expansion_search: 32)
+        index.expansion_search.should eq 32
+
+        index.expansion_search = 128
+        index.expansion_search.should eq 128
+
+        index.close
+      end
+    end
+
+    describe "#metric=" do
+      it "changes the metric at runtime" do
+        index = USearch::Index.new(dimensions: 4, metric: :cos)
+
+        # Change to L2
+        index.metric = :l2sq
+
+        # Add vectors and search with new metric
+        index.add(1_u64, [1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32])
+        index.add(2_u64, [0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32])
+
+        results = index.search([1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32], k: 1)
+        results[0].key.should eq 1_u64
+
+        index.close
       end
     end
 

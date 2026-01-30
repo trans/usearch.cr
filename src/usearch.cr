@@ -46,6 +46,130 @@ module USearch
   # Result of a nearest neighbor search.
   record SearchResult, key : UInt64, distance : Float32
 
+  # Metadata about a saved index (without loading it).
+  #
+  # Note: `size` is not available from metadata - it only returns init options.
+  record IndexMetadata,
+    metric : MetricKind,
+    dimensions : UInt64,
+    quantization : ScalarKind,
+    connectivity : UInt64,
+    expansion_add : UInt64,
+    expansion_search : UInt64,
+    multi : Bool
+
+  # Returns the SIMD acceleration in use (e.g., "avx2", "avx512", "neon").
+  def self.hardware_acceleration : String
+    String.new(LibUSearch.hardware_acceleration)
+  end
+
+  # Performs exact (brute-force) search across a dataset.
+  #
+  # This is useful for:
+  # - Small datasets where brute force is acceptable
+  # - Computing ground truth to verify HNSW results
+  # - Benchmarking approximate vs exact search
+  #
+  # - `dataset`: Array of vectors to search through
+  # - `queries`: Array of query vectors
+  # - `k`: Number of nearest neighbors per query
+  # - `metric`: Distance metric (default: cosine)
+  # - `threads`: Number of threads (default: 1)
+  #
+  # Returns an array of results per query, where each result is an array of SearchResult.
+  def self.exact_search(
+    dataset : Array(Array(Float32)),
+    queries : Array(Array(Float32)),
+    k : Int = 10,
+    metric : MetricKind = :cos,
+    threads : Int = 1
+  ) : Array(Array(SearchResult))
+    raise Error.new("Dataset cannot be empty") if dataset.empty?
+    raise Error.new("Queries cannot be empty") if queries.empty?
+    raise Error.new("k must be positive") if k <= 0
+    raise Error.new("threads must be positive") if threads <= 0
+
+    dims = dataset[0].size.to_u64
+    dataset_size = dataset.size.to_u64
+    queries_size = queries.size.to_u64
+    k_u64 = k.to_u64
+
+    dataset.each_with_index do |vec, i|
+      raise Error.new("Dataset vector #{i} dimension mismatch: expected #{dims}, got #{vec.size}") if vec.size.to_u64 != dims
+    end
+    queries.each_with_index do |vec, i|
+      raise Error.new("Query vector #{i} dimension mismatch: expected #{dims}, got #{vec.size}") if vec.size.to_u64 != dims
+    end
+
+    # Check for overflow before allocation (use checked multiplication)
+    dataset_elements = dataset_size.to_u128 * dims.to_u128
+    queries_elements = queries_size.to_u128 * dims.to_u128
+    result_elements = queries_size.to_u128 * k_u64.to_u128
+
+    max_size = UInt64::MAX.to_u128
+    raise Error.new("Dataset too large: would overflow") if dataset_elements > max_size
+    raise Error.new("Queries too large: would overflow") if queries_elements > max_size
+    raise Error.new("Result set too large: would overflow") if result_elements > max_size
+
+    # Flatten dataset and queries into contiguous arrays
+    flat_dataset = Slice(Float32).new(dataset_elements.to_u64)
+    dataset.each_with_index do |vec, i|
+      offset = i.to_u64 * dims
+      vec.each_with_index do |val, j|
+        flat_dataset[offset + j] = val
+      end
+    end
+
+    flat_queries = Slice(Float32).new(queries_elements.to_u64)
+    queries.each_with_index do |vec, i|
+      offset = i.to_u64 * dims
+      vec.each_with_index do |val, j|
+        flat_queries[offset + j] = val
+      end
+    end
+
+    # Output arrays
+    result_count = result_elements.to_u64
+    keys = Slice(UInt64).new(result_count, 0_u64)
+    distances = Slice(Float32).new(result_count, 0_f32)
+    error = Pointer(LibC::Char).null
+
+    # Stride is bytes between consecutive vectors
+    stride = dims * sizeof(Float32).to_u64
+
+    LibUSearch.exact_search(
+      flat_dataset.to_unsafe.as(Void*),
+      dataset_size,
+      stride,
+      flat_queries.to_unsafe.as(Void*),
+      queries_size,
+      stride,
+      LibUSearch::ScalarKind::F32,
+      dims,
+      metric,
+      k_u64,
+      threads.to_u64,
+      keys.to_unsafe,
+      k_u64 * sizeof(UInt64).to_u64,  # keys_stride: bytes between result sets
+      distances.to_unsafe,
+      k_u64 * sizeof(Float32).to_u64, # distances_stride: bytes between result sets
+      pointerof(error)
+    )
+
+    if error && !error.null?
+      message = String.new(error)
+      raise Error.new(message) unless message.empty?
+    end
+
+    # Convert flat results to nested arrays
+    Array(Array(SearchResult)).new(queries_size.to_i) do |q|
+      Array(SearchResult).new(k_u64.to_i) do |i|
+        idx = q.to_u64 * k_u64 + i.to_u64
+        SearchResult.new(keys[idx], distances[idx])
+      end
+    end
+  end
+
   # High-level wrapper for a USearch HNSW index.
   #
   # The index stores vectors and allows fast approximate nearest neighbor search.
@@ -110,10 +234,15 @@ module USearch
     # dimensions since they're needed to create the index before loading.
     def self.load(path : String, dimensions : Int, metric : MetricKind = :cos, quantization : ScalarKind = :f16) : Index
       index = new(dimensions, metric, quantization)
-      error = Pointer(LibC::Char).null
-      LibUSearch.load(index.@handle, path, pointerof(error))
-      index.check_error(error)
-      index
+      begin
+        error = Pointer(LibC::Char).null
+        LibUSearch.load(index.@handle, path, pointerof(error))
+        index.check_error(error)
+        index
+      rescue ex
+        index.close rescue nil
+        raise ex
+      end
     end
 
     # Memory-maps an index from a file (read-only, memory efficient).
@@ -122,10 +251,48 @@ module USearch
     # This is useful for large indexes that don't fit in RAM.
     def self.view(path : String, dimensions : Int, metric : MetricKind = :cos, quantization : ScalarKind = :f16) : Index
       index = new(dimensions, metric, quantization)
-      error = Pointer(LibC::Char).null
-      LibUSearch.view(index.@handle, path, pointerof(error))
-      index.check_error(error)
-      index
+      begin
+        error = Pointer(LibC::Char).null
+        LibUSearch.view(index.@handle, path, pointerof(error))
+        index.check_error(error)
+        index
+      rescue ex
+        index.close rescue nil
+        raise ex
+      end
+    end
+
+    # Loads an index from a byte buffer.
+    #
+    # The buffer is copied, so you can free it after this call.
+    def self.from_bytes(bytes : Bytes, dimensions : Int, metric : MetricKind = :cos, quantization : ScalarKind = :f16) : Index
+      index = new(dimensions, metric, quantization)
+      begin
+        error = Pointer(LibC::Char).null
+        LibUSearch.load_buffer(index.@handle, bytes.to_unsafe.as(Void*), bytes.size.to_u64, pointerof(error))
+        index.check_error(error)
+        index
+      rescue ex
+        index.close rescue nil
+        raise ex
+      end
+    end
+
+    # Views an index from a byte buffer (zero-copy, read-only).
+    #
+    # IMPORTANT: The bytes buffer must remain valid for the lifetime of the index.
+    # Do not modify or free the buffer while the index is in use.
+    def self.view_bytes(bytes : Bytes, dimensions : Int, metric : MetricKind = :cos, quantization : ScalarKind = :f16) : Index
+      index = new(dimensions, metric, quantization)
+      begin
+        error = Pointer(LibC::Char).null
+        LibUSearch.view_buffer(index.@handle, bytes.to_unsafe.as(Void*), bytes.size.to_u64, pointerof(error))
+        index.check_error(error)
+        index
+      rescue ex
+        index.close rescue nil
+        raise ex
+      end
     end
 
     # Adds a vector to the index.
@@ -274,6 +441,28 @@ module USearch
       check_error(error)
     end
 
+    # Returns the serialized size of the index in bytes.
+    def serialized_length : UInt64
+      check_open
+      error = Pointer(LibC::Char).null
+      result = LibUSearch.serialized_length(@handle, pointerof(error))
+      check_error(error)
+      result.to_u64
+    end
+
+    # Serializes the index to a byte buffer.
+    #
+    # Returns a new Bytes containing the serialized index.
+    def to_bytes : Bytes
+      check_open
+      length = serialized_length
+      buffer = Bytes.new(length)
+      error = Pointer(LibC::Char).null
+      LibUSearch.save_buffer(@handle, buffer.to_unsafe.as(Void*), length, pointerof(error))
+      check_error(error)
+      buffer
+    end
+
     # Returns the number of vectors in the index.
     def size : UInt64
       check_open
@@ -315,6 +504,34 @@ module USearch
       @reserved = true
     end
 
+    # Returns the current expansion factor for add operations.
+    def expansion_add : UInt64
+      check_open
+      error = Pointer(LibC::Char).null
+      result = LibUSearch.expansion_add(@handle, pointerof(error))
+      check_error(error)
+      result.to_u64
+    end
+
+    # Sets the expansion factor for add operations.
+    #
+    # Higher values = better graph quality but slower indexing. Default is 128.
+    def expansion_add=(value : Int)
+      check_open
+      error = Pointer(LibC::Char).null
+      LibUSearch.change_expansion_add(@handle, value.to_u64, pointerof(error))
+      check_error(error)
+    end
+
+    # Returns the current expansion factor for search operations.
+    def expansion_search : UInt64
+      check_open
+      error = Pointer(LibC::Char).null
+      result = LibUSearch.expansion_search(@handle, pointerof(error))
+      check_error(error)
+      result.to_u64
+    end
+
     # Sets the expansion factor for search operations.
     #
     # Higher values = more accurate but slower. Default is 64.
@@ -322,6 +539,28 @@ module USearch
       check_open
       error = Pointer(LibC::Char).null
       LibUSearch.change_expansion_search(@handle, value.to_u64, pointerof(error))
+      check_error(error)
+    end
+
+    # Changes the distance metric at runtime.
+    def metric=(metric : MetricKind)
+      check_open
+      error = Pointer(LibC::Char).null
+      LibUSearch.change_metric_kind(@handle, metric, pointerof(error))
+      check_error(error)
+    end
+
+    # Sets a custom distance metric function (advanced).
+    #
+    # The callback receives two raw vector pointers and returns a distance.
+    # You must know the vector dimensions and handle the pointer arithmetic.
+    #
+    # NOTE: The callback does not receive state, so you cannot use closures
+    # that capture variables. Use module-level functions or constants.
+    def set_custom_metric(callback : LibUSearch::MetricCallback, metric_kind : MetricKind = :unknown)
+      check_open
+      error = Pointer(LibC::Char).null
+      LibUSearch.change_metric(@handle, callback, Pointer(Void).null, metric_kind, pointerof(error))
       check_error(error)
     end
 
@@ -346,8 +585,8 @@ module USearch
       return if @closed
       error = Pointer(LibC::Char).null
       LibUSearch.free(@handle, pointerof(error))
-      @closed = true
       check_error(error)
+      @closed = true
     end
 
     # Returns true if the index has been closed.
@@ -356,13 +595,54 @@ module USearch
     end
 
     # Ensures the index is closed when garbage collected.
+    # Exceptions are swallowed since finalizers run during GC.
     def finalize
-      close
+      close rescue nil
     end
 
     # Returns the library version.
     def self.version : String
       String.new(LibUSearch.version)
+    end
+
+    # Reads metadata from a saved index file without loading it.
+    #
+    # Useful for inspecting index properties before deciding to load.
+    def self.metadata(path : String) : IndexMetadata
+      options = LibUSearch::InitOptions.new
+      error = Pointer(LibC::Char).null
+
+      LibUSearch.metadata(path, pointerof(options), pointerof(error))
+      check_error_static(error)
+
+      IndexMetadata.new(
+        options.metric_kind,
+        options.dimensions.to_u64,
+        options.quantization,
+        options.connectivity.to_u64,
+        options.expansion_add.to_u64,
+        options.expansion_search.to_u64,
+        options.multi
+      )
+    end
+
+    # Reads metadata from a serialized index buffer without loading it.
+    def self.metadata_buffer(bytes : Bytes) : IndexMetadata
+      options = LibUSearch::InitOptions.new
+      error = Pointer(LibC::Char).null
+
+      LibUSearch.metadata_buffer(bytes.to_unsafe.as(Void*), bytes.size.to_u64, pointerof(options), pointerof(error))
+      check_error_static(error)
+
+      IndexMetadata.new(
+        options.metric_kind,
+        options.dimensions.to_u64,
+        options.quantization,
+        options.connectivity.to_u64,
+        options.expansion_add.to_u64,
+        options.expansion_search.to_u64,
+        options.multi
+      )
     end
 
     # Computes distance between two vectors without an index.

@@ -13,22 +13,7 @@ Crystal bindings for [USearch](https://github.com/unum-cloud/usearch), a fast ap
 
 ## Installation
 
-### 1. Install libusearch
-
-```bash
-# Clone and build USearch
-git clone https://github.com/unum-cloud/usearch.git
-cd usearch
-cmake -B build -DUSEARCH_BUILD_LIB_C=1
-cmake --build build --config Release
-
-# Install (adjust path as needed)
-sudo cp build/libusearch_c.so /usr/local/lib/
-sudo cp c/usearch.h /usr/local/include/
-sudo ldconfig
-```
-
-### 2. Add the shard
+### 1. Add the shard
 
 ```yaml
 dependencies:
@@ -38,6 +23,32 @@ dependencies:
 
 ```bash
 shards install
+```
+
+### 2. Build libusearch
+
+```bash
+# Run the setup script (clones and builds usearch)
+./scripts/setup.sh
+```
+
+This clones USearch into `vendor/usearch/` and builds the static library. The library is statically linked, so no runtime dependencies are needed.
+
+#### Requirements
+
+- CMake 3.14+
+- C++17 compiler (GCC 8+ or Clang 10+)
+
+#### Dynamic linking (alternative)
+
+If you prefer dynamic linking:
+
+```bash
+# Build with dynamic linking flag
+crystal build -Dusearch_dynamic src/myapp.cr
+
+# Set library path at runtime
+LD_LIBRARY_PATH=vendor/usearch/build ./myapp
 ```
 
 ## Usage
@@ -82,6 +93,48 @@ index = USearch::Index.view("vectors.usearch", dimensions: 128)
 index.close
 ```
 
+### Filtered Search
+
+Search with a predicate to filter candidates:
+
+```crystal
+# Only return vectors with even keys
+results = index.filtered_search(query, k: 10) { |key| key.even? }
+
+# Only return vectors in a specific set
+valid_ids = Set{1_u64, 5_u64, 10_u64}
+results = index.filtered_search(query, k: 10) { |key| valid_ids.includes?(key) }
+```
+
+### Exact Search
+
+Brute-force search (useful for ground truth or small datasets):
+
+```crystal
+dataset = [vec1, vec2, vec3, ...]  # Array(Array(Float32))
+queries = [query1, query2]
+
+results = USearch.exact_search(dataset, queries, k: 10, metric: :cos)
+# results[0] = top-10 for query1, results[1] = top-10 for query2
+```
+
+### Serialization to Bytes
+
+```crystal
+# Serialize to bytes (for embedding in other formats)
+bytes = index.to_bytes
+
+# Load from bytes
+index = USearch::Index.from_bytes(bytes, dimensions: 128)
+
+# View from bytes (zero-copy, buffer must stay alive)
+index = USearch::Index.view_bytes(bytes, dimensions: 128)
+
+# Inspect metadata without loading
+meta = USearch::Index.metadata("vectors.usearch")
+puts meta.dimensions  # => 128
+```
+
 ## Metrics
 
 | Metric | Description |
@@ -107,7 +160,21 @@ index.close
 - Use `f16` quantization for 2x memory savings with minimal recall loss
 - Call `reserve(n)` before bulk inserts to avoid reallocations
 - Use `view()` instead of `load()` for very large indexes
-- Adjust `expansion_search` for speed/accuracy tradeoff
+- Tune `expansion_search` for speed/accuracy tradeoff:
+  ```crystal
+  index.expansion_search = 128  # Higher = more accurate, slower
+  index.expansion_add = 256     # Higher = better graph quality
+  ```
+
+## Utilities
+
+```crystal
+# Library version
+USearch::Index.version  # => "2.x.x"
+
+# SIMD acceleration in use
+USearch.hardware_acceleration  # => "avx2"
+```
 
 ## Development
 
