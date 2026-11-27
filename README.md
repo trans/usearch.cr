@@ -32,7 +32,7 @@ shards install
 ./scripts/setup.sh
 ```
 
-This clones USearch into `vendor/usearch/` and builds the static library. The library is statically linked, so no runtime dependencies are needed.
+This clones USearch, at the 2.x release the script names (`USEARCH_VERSION`), into `vendor/usearch/` and builds the static library. The library is statically linked, so no runtime dependencies are needed.
 
 #### Requirements
 
